@@ -1,7 +1,7 @@
 """Daman-style premium gaming platform backend.
 
 Features:
-- Mobile OTP auth (dev-mode fallback + Twilio real SMS when configured)
+- Email OTP authentication through SMTP
 - JWT sessions
 - Wallet, deposits, withdrawals, transactions
 - Games engine (38% win / 62% loss controlled server-side)
@@ -15,6 +15,7 @@ from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
 import logging
+import smtplib
 import math
 import asyncio
 import io
@@ -30,6 +31,7 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timezone, timedelta
+from email.message import EmailMessage
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
@@ -42,9 +44,11 @@ JWT_ALGO = os.environ.get("JWT_ALGO", "HS256")
 JWT_EXPIRES_HOURS = int(os.environ.get("JWT_EXPIRES_HOURS", "720"))
 ADMIN_SEED_PHONE = os.environ["ADMIN_SEED_PHONE"]
 ADMIN_SEED_PASSWORD = os.environ["ADMIN_SEED_PASSWORD"]
-TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "")
-TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
-TWILIO_VERIFY_SERVICE = os.environ.get("TWILIO_VERIFY_SERVICE", "")
+SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_EMAIL = os.environ.get("SMTP_EMAIL", "").strip()
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "").strip()
+SMTP_FROM = os.environ.get("SMTP_FROM", "").strip() or SMTP_EMAIL
 PLAYER_WIN_RATE = float(os.environ.get("PLAYER_WIN_RATE", "0.38"))
 
 client = AsyncIOMotorClient(mongo_url)
@@ -133,29 +137,40 @@ async def get_current_admin(authorization: Optional[str] = Header(None)) -> dict
     return admin
 
 
-# ------- Twilio helpers -------
-_twilio_enabled = bool(TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_VERIFY_SERVICE)
-_twilio_client = None
-if _twilio_enabled:
-    try:
-        from twilio.rest import Client as TwilioClient
-        _twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-    except Exception as e:
-        logger.warning(f"Twilio init failed, fallback to dev-mode OTP: {e}")
-        _twilio_enabled = False
-
-
+# ------- SMTP Email OTP helpers -------
 def gen_otp() -> str:
     return "".join(secrets.choice(string.digits) for _ in range(6))
 
 
+def send_email_otp(to_email: str, otp: str) -> None:
+    """Send a short-lived login OTP through the configured SMTP server."""
+    if not all((SMTP_HOST, SMTP_PORT, SMTP_EMAIL, SMTP_PASSWORD, SMTP_FROM)):
+        raise RuntimeError("SMTP is not configured. Set SMTP_HOST, SMTP_PORT, SMTP_EMAIL, SMTP_PASSWORD and SMTP_FROM.")
+
+    message = EmailMessage()
+    message["Subject"] = "Your Daman Gaming login OTP"
+    message["From"] = SMTP_FROM
+    message["To"] = to_email
+    message.set_content(
+        f"Your Daman Gaming verification code is: {otp}\n\n"
+        "This code is valid for 5 minutes. Do not share it with anyone."
+    )
+
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as smtp:
+        smtp.ehlo()
+        smtp.starttls()
+        smtp.ehlo()
+        smtp.login(SMTP_EMAIL, SMTP_PASSWORD)
+        smtp.send_message(message)
+
+
 # ------- Models -------
 class SendOtpIn(BaseModel):
-    phone: str
+    email: str
 
 
 class VerifyOtpIn(BaseModel):
-    phone: str
+    email: str
     otp: str
     name: Optional[str] = None
     referral: Optional[str] = None
@@ -511,61 +526,65 @@ async def add_transaction(user_id: str, kind: str, amount: float, meta: dict, st
 # =========================================================
 @api.post("/auth/send-otp")
 async def send_otp(payload: SendOtpIn):
-    phone = payload.phone.strip()
-    if not phone.startswith("+") or len(phone) < 8:
-        raise HTTPException(400, "Phone must be in E.164 (e.g. +919999999999)")
+    email = payload.email.strip().lower()
+    if not email or "@" not in email or len(email) > 254 or " " in email:
+        raise HTTPException(400, "Please provide a valid email address")
+
+    if not all((SMTP_HOST, SMTP_EMAIL, SMTP_PASSWORD, SMTP_FROM)):
+        logger.error("SMTP email OTP requested but SMTP credentials are not configured")
+        raise HTTPException(503, "Email OTP service is not configured")
 
     otp = gen_otp()
-    # store OTP with 5-min expiry
+    try:
+        await asyncio.to_thread(send_email_otp, email, otp)
+    except Exception as e:
+        logger.error(f"SMTP email OTP send failed for {email}: {e}")
+        raise HTTPException(503, "Unable to send OTP email. Please try again later.")
+
+    # Save the OTP only after SMTP confirms that the email was sent.
     await db.otps.update_one(
-        {"phone": phone},
-        {"$set": {"phone": phone, "otp": otp, "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(), "created_at": now_iso()}},
+        {"email": email},
+        {"$set": {
+            "email": email,
+            "otp": otp,
+            "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(),
+            "created_at": now_iso(),
+        }},
         upsert=True,
     )
-
-    if _twilio_enabled:
-        try:
-            _twilio_client.verify.v2.services(TWILIO_VERIFY_SERVICE).verifications.create(to=phone, channel="sms")
-            return {"success": True, "dev_mode": False}
-        except Exception as e:
-            logger.error(f"Twilio failure, falling back to dev OTP: {e}")
-
-    # dev-mode: return OTP directly (visible for testing)
-    logger.info(f"DEV OTP for {phone}: {otp}")
-    return {"success": True, "dev_mode": True, "otp": otp}
+    return {"success": True, "dev_mode": False, "message": "OTP sent to your email"}
 
 
 @api.post("/auth/verify-otp")
 async def verify_otp(payload: VerifyOtpIn):
-    phone = payload.phone.strip()
-    if _twilio_enabled:
-        try:
-            check = _twilio_client.verify.v2.services(TWILIO_VERIFY_SERVICE).verification_checks.create(to=phone, code=payload.otp)
-            if check.status != "approved":
-                raise HTTPException(400, "Invalid OTP")
-        except HTTPException:
-            raise
-        except Exception:
-            # fall through to local OTP check
-            pass
+    email = payload.email.strip().lower()
+    if not email or "@" not in email or len(email) > 254 or " " in email:
+        raise HTTPException(400, "Please provide a valid email address")
 
-    # local (dev) OTP check
-    rec = await db.otps.find_one({"phone": phone})
-    if not _twilio_enabled:
-        if not rec or rec.get("otp") != payload.otp:
-            raise HTTPException(400, "Invalid OTP")
-        if datetime.fromisoformat(rec["expires_at"]) < datetime.now(timezone.utc):
-            raise HTTPException(400, "OTP expired")
+    rec = await db.otps.find_one({"email": email})
+    if not rec or not secrets.compare_digest(str(rec.get("otp", "")), payload.otp.strip()):
+        raise HTTPException(400, "Invalid OTP")
+    try:
+        expires_at = datetime.fromisoformat(rec["expires_at"])
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+    except (KeyError, TypeError, ValueError):
+        await db.otps.delete_many({"email": email})
+        raise HTTPException(400, "OTP expired")
+    if expires_at < datetime.now(timezone.utc):
+        await db.otps.delete_many({"email": email})
+        raise HTTPException(400, "OTP expired")
 
-    # find or create user
-   # find or create user
-    user = clean(await db.users.find_one({"phone": phone}))
+    # Find or create the player by verified email address.
+    user = clean(await db.users.find_one({"email": email}))
     if not user:
         cfg = await db.payment_config.find_one({"id": "default"}) or {}
         welcome_bonus = float(cfg.get("welcome_bonus", 50.0))
         user = {
             "id": new_id(),
-            "phone": phone,
+            "email": email,
+            # Keep the legacy phone field present for existing wallet/admin records.
+            "phone": "",
             "uid": make_uid(),
             "name": payload.name or f"Player{secrets.randbelow(9999)}",
             "avatar": None,
@@ -591,7 +610,7 @@ async def verify_otp(payload: VerifyOtpIn):
     else:
         await db.users.update_one({"id": user["id"]}, {"$set": {"last_login": now_iso()}})
 
-    await db.otps.delete_many({"phone": phone})
+    await db.otps.delete_many({"email": email})
     token = create_token(user["id"], "user")
     return {"success": True, "token": token, "user": clean(await db.users.find_one({"id": user["id"]}))}
 
